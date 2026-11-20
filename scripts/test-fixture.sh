@@ -1,25 +1,31 @@
 #!/usr/bin/env bash
 #
-# Offline adoption test: a miniature consumer tree (test/fixtures/local-cluster)
-# instantiates stacks/local-cluster and must get its unit at exactly
-# live/dev/rancherlocal/local-cluster, so the state key (path_relative_to_include)
-# stays dev/rancherlocal/local-cluster. Then `terragrunt validate` runs on the
-# generated unit with mocked dependency outputs.
+# Offline adoption test, one case per fixture: a miniature consumer tree
+# (test/fixtures/<case>) instantiates catalog stacks or units and must get
+# every unit at exactly the directory a hand-written unit would occupy, so the
+# state key (path_relative_to_include) is the consumer's choice:
+#
+#   local-cluster  ->  live/dev/rancherlocal/local-cluster   (stacks/local-cluster)
+#   key-vault      ->  live/dev/keyvault                     (stacks/key-vault)
+#   region         ->  live/dev/westus3/{hub,aks-spoke}      (units/hub, units/aks-spoke)
+#
+# Then `terragrunt validate` runs on each generated unit (mocked dependency
+# outputs where the unit has dependencies).
 #
 # No Azure access: local backend, no ARM_* credentials (unset below). It does
 # need network for `terraform init`: the modules repo, the AVM modules it pins
 # and the Terraform providers.
 #
-# Usage: scripts/test-fixture.sh
-#   CATALOG_ROOT           catalog working tree to test (default: this repo)
-#   CATALOG_STACK_SOURCE / CATALOG_UNIT_SOURCE
-#                          override the stack/unit source, e.g. a pinned
-#                          git::https://...?ref=vX.Y.Z URL (default: CATALOG_ROOT paths)
-#   KEEP=1                 keep the temp copy for inspection
+# Usage: scripts/test-fixture.sh [local-cluster|key-vault|region ...]   (default: all)
+#   CATALOG_ROOT   catalog working tree to test (default: this repo)
+#   CATALOG_REF    test a pushed ref instead of the working tree, e.g. v1.2.0
+#                  (stacks and units are fetched from the catalog repo at that ref)
+#   KEEP=1         keep the temp copy for inspection
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export CATALOG_ROOT="${CATALOG_ROOT:-${REPO_ROOT}}"
+CATALOG_ROOT="${CATALOG_ROOT:-${REPO_ROOT}}"
+CATALOG_GIT="git::https://github.com/traviscloud-com/cloud-platform-catalog-example.git"
 
 unset ARM_CLIENT_ID ARM_CLIENT_SECRET ARM_SUBSCRIPTION_ID ARM_TENANT_ID ARM_USE_OIDC ARM_OIDC_TOKEN
 export TG_NON_INTERACTIVE=true TG_NO_COLOR=true
@@ -28,37 +34,78 @@ export TG_NON_INTERACTIVE=true TG_NO_COLOR=true
 WORK="$(mktemp -d)"
 cleanup() { if [ "${KEEP:-}" = 1 ]; then echo "kept ${WORK}"; else rm -rf "${WORK}"; fi; }
 trap cleanup EXIT
-cp -r "${REPO_ROOT}/test/fixtures/local-cluster/live" "${WORK}/live"
-
-EXPECTED_DIR="${WORK}/live/dev/rancherlocal/local-cluster"
-EXPECTED_KEY="dev/rancherlocal/local-cluster"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-echo "== terragrunt stack generate"
-(cd "${WORK}/live/dev/rancherlocal" && terragrunt stack generate)
+# run_case <case> <dir holding terragrunt.stack.hcl, relative to live/> <unit dir name>...
+run_case() {
+  local case_name="$1" stack_dir="$2"
+  shift 2
+  local live="${WORK}/${case_name}/live"
 
-echo "== assert unit directory"
-[ -f "${EXPECTED_DIR}/terragrunt.hcl" ] || fail "unit not generated at ${EXPECTED_DIR#"${WORK}/"}"
-[ -f "${EXPECTED_DIR}/terragrunt.values.hcl" ] || fail "values file missing in unit dir"
-# Nothing may land in a .terragrunt-stack dir or one level deeper.
-if find "${WORK}/live" -name .terragrunt-stack -o -path '*/local-cluster/local-cluster' | grep -q .; then
-  fail "unexpected nested/.terragrunt-stack directory generated"
-fi
-units="$(cd "${WORK}/live" && find . -name terragrunt.hcl -path '*rancherlocal*' | sort)"
-[ "${units}" = "./dev/rancherlocal/local-cluster/terragrunt.hcl" ] || fail "unexpected units: ${units}"
-echo "ok: live/dev/rancherlocal/local-cluster"
+  echo "=== ${case_name}"
+  # Fixtures build their sources from these: <prefix>stacks/<name><suffix> or
+  # <prefix>units/<name><suffix>. The two *_SOURCE variables serve the
+  # single-unit stack fixtures, whose stack is named like the case.
+  if [ -n "${CATALOG_REF:-}" ]; then
+    export CATALOG_SOURCE_PREFIX="${CATALOG_GIT}//" CATALOG_SOURCE_SUFFIX="?ref=${CATALOG_REF}"
+  else
+    export CATALOG_SOURCE_PREFIX="${CATALOG_ROOT}/" CATALOG_SOURCE_SUFFIX=""
+  fi
+  export CATALOG_STACK_SOURCE="${CATALOG_SOURCE_PREFIX}stacks/${case_name}${CATALOG_SOURCE_SUFFIX}"
+  export CATALOG_UNIT_SOURCE="${CATALOG_SOURCE_PREFIX}units/${case_name}${CATALOG_SOURCE_SUFFIX}"
 
-echo "== terragrunt validate (mocked dependency, local backend)"
-(cd "${EXPECTED_DIR}" && terragrunt validate)
+  mkdir -p "${WORK}/${case_name}"
+  cp -r "${REPO_ROOT}/test/fixtures/${case_name}/live" "${live}"
 
-echo "== assert state key"
-# generate blocks are written into the unit's .terragrunt-cache working dir.
-key_file="$(find "${EXPECTED_DIR}/.terragrunt-cache" -name state-key.txt | head -1)"
-backend_file="$(find "${EXPECTED_DIR}/.terragrunt-cache" -name backend.tf | head -1)"
-[ -n "${key_file}" ] && [ -n "${backend_file}" ] || fail "generated state-key.txt/backend.tf not found"
-key="$(grep -v '^# Generated by Terragrunt' "${key_file}" | tr -d '\n')"
-[ "${key}" = "${EXPECTED_KEY}" ] || fail "path_relative_to_include is '${key}', expected '${EXPECTED_KEY}'"
-grep -q "${EXPECTED_KEY}/terraform.tfstate" "${backend_file}" || fail "backend.tf does not contain ${EXPECTED_KEY}/terraform.tfstate"
-echo "ok: path_relative_to_include = ${key}; backend key = ${key}/terraform.tfstate"
+  echo "== terragrunt stack generate"
+  (cd "${live}/${stack_dir}" && terragrunt stack generate)
+
+  echo "== assert unit directories"
+  local unit expected=""
+  for unit in "$@"; do
+    [ -f "${live}/${stack_dir}/${unit}/terragrunt.hcl" ] || fail "unit not generated at live/${stack_dir}/${unit}"
+    [ -f "${live}/${stack_dir}/${unit}/terragrunt.values.hcl" ] || fail "values file missing in live/${stack_dir}/${unit}"
+    # Nothing may land one level deeper.
+    [ ! -e "${live}/${stack_dir}/${unit}/${unit}" ] || fail "nested unit directory live/${stack_dir}/${unit}/${unit}"
+    expected="${expected}./${stack_dir}/${unit}/terragrunt.hcl"$'\n'
+  done
+  if find "${live}" -name .terragrunt-stack | grep -q .; then
+    fail "unexpected .terragrunt-stack directory generated"
+  fi
+  # The generated units are the only non-empty terragrunt.hcl (stubs are comments only).
+  local units
+  units="$(cd "${live}" && find . -name terragrunt.hcl -not -path '*/.terragrunt-cache/*' -exec grep -lE '^[a-z]' {} + | sort)"
+  [ "${units}" = "$(printf '%s' "${expected}" | sort)" ] || fail "unexpected units: ${units}"
+
+  for unit in "$@"; do
+    local expected_key="${stack_dir}/${unit}"
+    local expected_dir="${live}/${expected_key}"
+    echo "ok: live/${expected_key}"
+
+    echo "== terragrunt validate ${unit} (local backend)"
+    (cd "${expected_dir}" && terragrunt validate)
+
+    echo "== assert state key"
+    # generate blocks are written into the unit's .terragrunt-cache working dir.
+    local key_file backend_file key
+    key_file="$(find "${expected_dir}/.terragrunt-cache" -name state-key.txt | head -1)"
+    backend_file="$(find "${expected_dir}/.terragrunt-cache" -name backend.tf | head -1)"
+    [ -n "${key_file}" ] && [ -n "${backend_file}" ] || fail "generated state-key.txt/backend.tf not found"
+    key="$(grep -v '^# Generated by Terragrunt' "${key_file}" | tr -d '\n')"
+    [ "${key}" = "${expected_key}" ] || fail "path_relative_to_include is '${key}', expected '${expected_key}'"
+    grep -q "${expected_key}/terraform.tfstate" "${backend_file}" || fail "backend.tf does not contain ${expected_key}/terraform.tfstate"
+    echo "ok: path_relative_to_include = ${key}; backend key = ${key}/terraform.tfstate"
+  done
+}
+
+[ "$#" -gt 0 ] || set -- local-cluster key-vault region
+for case_name in "$@"; do
+  case "${case_name}" in
+    local-cluster) run_case local-cluster dev/rancherlocal local-cluster ;;
+    key-vault) run_case key-vault dev keyvault ;;
+    region) run_case region dev/westus3 hub aks-spoke ;;
+    *) echo "usage: $0 [local-cluster|key-vault|region ...]" >&2; exit 2 ;;
+  esac
+done
 
 echo "PASS"

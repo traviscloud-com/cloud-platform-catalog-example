@@ -1,17 +1,16 @@
-# Consumer side. CATALOG_ROOT (local working tree) or CATALOG_STACK_SOURCE /
-# CATALOG_UNIT_SOURCE (e.g. git::...?ref=) override the source; a real consumer
-# hard-codes the pinned git URL instead (see README).
-#
 # Consumer side: instantiates the catalog's local-cluster stack so that the
 # unit lands at live/dev/rancherlocal/local-cluster (state key unchanged).
+# scripts/test-fixture.sh sets CATALOG_STACK_SOURCE / CATALOG_UNIT_SOURCE
+# (working tree, or a pushed ref with CATALOG_REF); a real consumer hard-codes
+# the pinned git URL (see README).
 stack "local_cluster" {
-  source = get_env("CATALOG_STACK_SOURCE", "${get_env("CATALOG_ROOT", "")}/stacks/local-cluster")
+  source = get_env("CATALOG_STACK_SOURCE")
   path   = "local-cluster"
 
   no_dot_terragrunt_stack = true
 
   values = {
-    unit_source = get_env("CATALOG_UNIT_SOURCE", "${get_env("CATALOG_ROOT", "")}/units/local-cluster")
+    unit_source = get_env("CATALOG_UNIT_SOURCE")
 
     environment = "rancherlocal"
     location    = "westus3"
