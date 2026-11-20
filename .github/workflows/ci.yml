@@ -1,0 +1,70 @@
+# Static checks plus the offline adoption fixture. No Azure credentials are
+# used anywhere: the fixture runs against a local backend with mocked
+# dependency outputs. Secret scanning lives in gitleaks.yml.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TERRAFORM_VERSION: 1.15.8
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned tools (terragrunt)
+        run: |
+          scripts/install-tools.sh terragrunt
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: terragrunt hcl fmt --check
+        run: scripts/lint.sh fmt
+
+  fixture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install pinned tools (terragrunt)
+        run: |
+          scripts/install-tools.sh terragrunt
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Offline adoption fixture
+        run: scripts/test-fixture.sh
+
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned tools (trivy)
+        run: |
+          scripts/install-tools.sh trivy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: trivy config scan
+        run: scripts/lint.sh trivy
